@@ -1,0 +1,491 @@
+import json
+import threading
+import winsound
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import tkinter as tk
+from tkinter import messagebox
+
+import requests
+from plyer import notification
+
+
+# =========================================
+# CONFIGURACION
+# =========================================
+
+API_KEY = "TU API KEY"
+XUID = "TU XUID"
+
+ZONA_HORARIA = timezone(timedelta(hours=-5))
+DIAS_RECIENTES = 3
+MAX_JUEGOS_A_REVISAR = 30
+
+CARPETA_APP = Path(__file__).resolve().parent
+ARCHIVO_HISTORIAL = CARPETA_APP / "historial_logros.json"
+
+headers = {
+    "X-Authorization": API_KEY,
+    "Accept": "application/json",
+}
+
+
+# =========================================
+# LOGICA XBOX
+# =========================================
+
+def convertir_fecha_xbox(valor):
+    if not valor or valor.startswith("0001-01-01"):
+        return None
+
+    valor = valor.replace("Z", "+00:00")
+
+    if "." in valor:
+        fecha, resto = valor.split(".", 1)
+
+        digitos = ""
+        i = 0
+
+        while i < len(resto) and resto[i].isdigit():
+            digitos += resto[i]
+            i += 1
+
+        zona = resto[i:]
+        microsegundos = digitos[:6].ljust(6, "0")
+        valor = f"{fecha}.{microsegundos}{zona}"
+
+    return datetime.fromisoformat(valor)
+
+
+def obtener_juegos():
+    url = f"https://xbl.io/api/v2/achievements/player/{XUID}"
+    response = requests.get(url, headers=headers, timeout=20)
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Error al obtener juegos: {response.status_code}\n{response.text}")
+
+    datos = response.json()
+    return datos.get("content", {}).get("titles", [])
+
+
+def obtener_logros(title_id):
+    url = f"https://xbl.io/api/v2/achievements/player/{XUID}/{title_id}"
+    response = requests.get(url, headers=headers, timeout=20)
+
+    if response.status_code != 200:
+        return []
+
+    datos = response.json()
+    return datos.get("content", {}).get("achievements", [])
+
+
+def revisar_logro_diario():
+    hoy = datetime.now(ZONA_HORARIA).date()
+    limite = hoy - timedelta(days=DIAS_RECIENTES)
+
+    juegos = obtener_juegos()
+    juegos_recientes = []
+
+    for juego in juegos:
+        historial = juego.get("titleHistory") or {}
+        ultima_vez = historial.get("lastTimePlayed")
+        fecha_ultima = convertir_fecha_xbox(ultima_vez)
+
+        if not fecha_ultima:
+            continue
+
+        fecha_local = fecha_ultima.astimezone(ZONA_HORARIA).date()
+
+        if fecha_local >= limite:
+            juegos_recientes.append(juego)
+
+    juegos_recientes = juegos_recientes[:MAX_JUEGOS_A_REVISAR]
+    logros_hoy = []
+
+    for juego in juegos_recientes:
+        nombre_juego = juego.get("name", "Desconocido")
+        title_id = juego.get("titleId")
+
+        if not title_id:
+            continue
+
+        logros = obtener_logros(title_id)
+
+        for logro in logros:
+            if logro.get("progressState") != "Achieved":
+                continue
+
+            progreso = logro.get("progression") or {}
+            desbloqueado = convertir_fecha_xbox(progreso.get("timeUnlocked"))
+
+            if not desbloqueado:
+                continue
+
+            desbloqueado_local = desbloqueado.astimezone(ZONA_HORARIA)
+
+            if desbloqueado_local.date() == hoy:
+                logros_hoy.append({
+                    "juego": nombre_juego,
+                    "logro": logro.get("name", "Logro desconocido"),
+                    "hora": desbloqueado_local.strftime("%H:%M"),
+                })
+
+    return {
+        "fecha": hoy.isoformat(),
+        "logro_hoy": bool(logros_hoy),
+        "logros": logros_hoy,
+        "juegos_revisados": len(juegos_recientes),
+        "total_juegos": len(juegos),
+        "ultima_revision": datetime.now(ZONA_HORARIA).strftime("%H:%M"),
+    }
+
+
+# =========================================
+# HISTORIAL Y RACHA
+# =========================================
+
+def cargar_historial():
+    if not ARCHIVO_HISTORIAL.exists():
+        return {}
+
+    try:
+        with ARCHIVO_HISTORIAL.open("r", encoding="utf-8") as archivo:
+            return json.load(archivo)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def guardar_resultado(resultado):
+    historial = cargar_historial()
+    historial[resultado["fecha"]] = resultado
+
+    with ARCHIVO_HISTORIAL.open("w", encoding="utf-8") as archivo:
+        json.dump(historial, archivo, ensure_ascii=False, indent=2)
+
+    return historial
+
+
+def calcular_racha(historial):
+    hoy = datetime.now(ZONA_HORARIA).date()
+    racha = 0
+    dia = hoy
+
+    while True:
+        registro = historial.get(dia.isoformat())
+
+        if not registro or not registro.get("logro_hoy"):
+            break
+
+        racha += 1
+        dia -= timedelta(days=1)
+
+    mejor_racha = 0
+    racha_temporal = 0
+
+    for fecha in sorted(historial):
+        if historial[fecha].get("logro_hoy"):
+            racha_temporal += 1
+            mejor_racha = max(mejor_racha, racha_temporal)
+        else:
+            racha_temporal = 0
+
+    return racha, mejor_racha
+
+
+def obtener_ultimo_logro(historial):
+    for fecha in sorted(historial, reverse=True):
+        registro = historial.get(fecha, {})
+        logros = registro.get("logros") or []
+
+        if logros:
+            logro = logros[0]
+            return {
+                "fecha": fecha,
+                "logro": logro.get("logro", "Logro desconocido"),
+                "juego": logro.get("juego", "Juego desconocido"),
+                "hora": logro.get("hora", "--:--"),
+            }
+
+    return None
+
+
+# =========================================
+# INTERFAZ
+# =========================================
+
+def reproducir_sonido(exito):
+    if exito:
+        winsound.MessageBeep(winsound.MB_ICONASTERISK)
+    else:
+        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+
+
+def actualizar_interfaz(resultado, historial):
+    racha, mejor_racha = calcular_racha(historial)
+
+    if resultado["logro_hoy"]:
+        primero = resultado["logros"][0]
+        texto_estado = "Logro de hoy completado"
+        detalle = f"{primero['logro']} - {primero['juego']} a las {primero['hora']}"
+        color = "#15803d"
+        mensaje = f"Ya sacaste logro hoy: {primero['logro']} ({primero['juego']})"
+    else:
+        texto_estado = "Logro de hoy pendiente"
+        detalle = "Todavia no aparece ningun logro desbloqueado hoy."
+        color = "#d97706"
+        mensaje = "No olvides sacar tu logro diario de Xbox."
+
+    estado_label.config(text=texto_estado, fg=color)
+    detalle_label.config(text=detalle)
+    racha_label.config(text=f"Racha actual: {racha} dias    Mejor racha: {mejor_racha} dias")
+    actualizar_ultimo_logro(historial)
+    info_label.config(
+        text=(
+            f"Ultima revision: {resultado['ultima_revision']} | "
+            f"Juegos revisados: {resultado['juegos_revisados']}/{resultado['total_juegos']}"
+        )
+    )
+
+    notification.notify(
+        title="Xbox Tracker",
+        message=mensaje,
+        timeout=10,
+    )
+
+    reproducir_sonido(resultado["logro_hoy"])
+
+
+def actualizar_ultimo_logro(historial):
+    ultimo = obtener_ultimo_logro(historial)
+
+    if not ultimo:
+        ultimo_logro_label.config(text="Ultimo logro: aun no hay logros guardados")
+        return
+
+    ultimo_logro_label.config(
+        text=(
+            f"Ultimo logro: {ultimo['logro']} | {ultimo['juego']} | "
+            f"{ultimo['fecha']} {ultimo['hora']}"
+        )
+    )
+
+
+def abrir_historial():
+    historial = cargar_historial()
+
+    ventana_historial = tk.Toplevel(ventana)
+    ventana_historial.title("Historial de logros")
+    ventana_historial.geometry("560x420")
+    ventana_historial.resizable(False, False)
+    ventana_historial.configure(bg="#f8fafc")
+
+    titulo_historial = tk.Label(
+        ventana_historial,
+        text="Historial reciente",
+        font=("Segoe UI", 18, "bold"),
+        bg="#f8fafc",
+        fg="#0f172a",
+    )
+    titulo_historial.pack(pady=(18, 8))
+
+    contenedor_lista = tk.Frame(ventana_historial, bg="#f8fafc", padx=18)
+    contenedor_lista.pack(fill="both", expand=True)
+
+    texto = tk.Text(
+        contenedor_lista,
+        height=14,
+        width=64,
+        font=("Consolas", 10),
+        bg="white",
+        fg="#0f172a",
+        relief="solid",
+        borderwidth=1,
+        padx=10,
+        pady=10,
+        wrap="word",
+    )
+    texto.pack(fill="both", expand=True)
+
+    if not historial:
+        texto.insert("end", "Todavia no hay historial guardado.")
+    else:
+        fechas = sorted(historial, reverse=True)[:30]
+
+        for fecha in fechas:
+            registro = historial.get(fecha, {})
+            logros = registro.get("logros") or []
+
+            if logros:
+                primero = logros[0]
+                linea = (
+                    f"{fecha}  SI  {primero.get('hora', '--:--')}  "
+                    f"{primero.get('logro', 'Logro desconocido')} "
+                    f"({primero.get('juego', 'Juego desconocido')})\n"
+                )
+            else:
+                linea = f"{fecha}  NO  Sin logro registrado\n"
+
+            texto.insert("end", linea)
+
+    texto.config(state="disabled")
+
+    boton_cerrar = tk.Button(
+        ventana_historial,
+        text="Cerrar",
+        font=("Segoe UI", 10, "bold"),
+        command=ventana_historial.destroy,
+        width=12,
+        bg="#334155",
+        fg="white",
+        activebackground="#1e293b",
+        activeforeground="white",
+        relief="flat",
+        pady=6,
+    )
+    boton_cerrar.pack(pady=14)
+
+
+def revisar_desde_interfaz():
+    boton_revisar.config(state="disabled")
+    estado_label.config(text="Revisando tus logros...", fg="#2563eb")
+    detalle_label.config(text="Consultando OpenXBL, espera un momento.")
+
+    def tarea():
+        try:
+            resultado = revisar_logro_diario()
+            historial = guardar_resultado(resultado)
+            ventana.after(0, lambda: actualizar_interfaz(resultado, historial))
+        except Exception as error:
+            ventana.after(0, lambda: messagebox.showerror("Xbox Tracker", str(error)))
+            ventana.after(0, lambda: estado_label.config(text="No se pudo revisar", fg="#dc2626"))
+        finally:
+            ventana.after(0, lambda: boton_revisar.config(state="normal"))
+
+    threading.Thread(target=tarea, daemon=True).start()
+
+
+def abrir_interfaz():
+    global ventana, estado_label, detalle_label, boton_revisar, racha_label, info_label, ultimo_logro_label
+
+    ventana = tk.Tk()
+    ventana.title("Xbox Logro Diario")
+    ventana.geometry("560x500")
+    ventana.resizable(False, False)
+    ventana.configure(bg="#f8fafc")
+
+    contenedor = tk.Frame(ventana, bg="#f8fafc", padx=28, pady=22)
+    contenedor.pack(fill="both", expand=True)
+
+    titulo = tk.Label(
+        contenedor,
+        text="Xbox Logro Diario",
+        font=("Segoe UI", 22, "bold"),
+        bg="#f8fafc",
+        fg="#0f172a",
+    )
+    titulo.pack(pady=(4, 2))
+
+    autor = tk.Label(
+        contenedor,
+        text="Hecho por Santiago Rojas",
+        font=("Segoe UI", 10),
+        bg="#f8fafc",
+        fg="#64748b",
+    )
+    autor.pack(pady=(0, 22))
+
+    estado_label = tk.Label(
+        contenedor,
+        text="Presiona revisar para consultar tu logro diario",
+        font=("Segoe UI", 15, "bold"),
+        bg="#f8fafc",
+        fg="#334155",
+        wraplength=440,
+    )
+    estado_label.pack(pady=(0, 10))
+
+    detalle_label = tk.Label(
+        contenedor,
+        text="Tu historial y racha se guardaran automaticamente.",
+        font=("Segoe UI", 11),
+        bg="#f8fafc",
+        fg="#475569",
+        wraplength=440,
+        justify="center",
+    )
+    detalle_label.pack(pady=(0, 20))
+
+    boton_revisar = tk.Button(
+        contenedor,
+        text="Revisar ahora",
+        font=("Segoe UI", 12, "bold"),
+        command=revisar_desde_interfaz,
+        width=18,
+        bg="#107c10",
+        fg="white",
+        activebackground="#0b6a0b",
+        activeforeground="white",
+        relief="flat",
+        padx=10,
+        pady=8,
+    )
+    boton_revisar.pack(pady=(0, 22))
+
+    boton_historial = tk.Button(
+        contenedor,
+        text="Ver historial",
+        font=("Segoe UI", 10, "bold"),
+        command=abrir_historial,
+        width=16,
+        bg="#334155",
+        fg="white",
+        activebackground="#1e293b",
+        activeforeground="white",
+        relief="flat",
+        padx=8,
+        pady=6,
+    )
+    boton_historial.pack(pady=(0, 18))
+
+    racha_label = tk.Label(
+        contenedor,
+        text="Racha actual: 0 dias    Mejor racha: 0 dias",
+        font=("Segoe UI", 11, "bold"),
+        bg="#f8fafc",
+        fg="#0f172a",
+    )
+    racha_label.pack(pady=(0, 12))
+
+    ultimo_logro_label = tk.Label(
+        contenedor,
+        text="Ultimo logro: aun no hay logros guardados",
+        font=("Segoe UI", 10),
+        bg="#f8fafc",
+        fg="#475569",
+        wraplength=480,
+        justify="center",
+    )
+    ultimo_logro_label.pack(pady=(0, 10))
+
+    info_label = tk.Label(
+        contenedor,
+        text="Tracker conectado con OpenXBL",
+        font=("Segoe UI", 9),
+        bg="#f8fafc",
+        fg="#64748b",
+        wraplength=460,
+    )
+    info_label.pack(side="bottom", pady=(16, 0))
+
+    historial_inicial = cargar_historial()
+    racha_inicial, mejor_racha_inicial = calcular_racha(historial_inicial)
+    racha_label.config(
+        text=f"Racha actual: {racha_inicial} dias    Mejor racha: {mejor_racha_inicial} dias"
+    )
+    actualizar_ultimo_logro(historial_inicial)
+
+    ventana.mainloop()
+
+
+if __name__ == "__main__":
+    abrir_interfaz()
